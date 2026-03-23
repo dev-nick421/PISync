@@ -1,0 +1,9 @@
+## Interface: 120001
+## Title: PISync - Power Infusion Coordinator
+## Notes: Whisper-based Power Infusion coordination between priest and DPS. Send "PI me!" to request, track buff & cooldown timers.
+## Author: Nick
+## Version: 1.0.0
+## SavedVariables: PISyncDB
+## IconTexture: Interface\Icons\Spell_Holy_PowerInfusion
+
+Core.lua
