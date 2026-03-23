@@ -19,6 +19,13 @@ local PI_COOLDOWN_REMAINING = PI_COOLDOWN_TOTAL - PI_BUFF_DURATION  -- 105s
 local WHISPER_REQUEST   = "PI me!"
 local WHISPER_ACTIVATED = "PI activated"
 
+----------------------------------------------------------------------
+-- Addon-channel messaging (12.0 fix: works in combat / instances)
+----------------------------------------------------------------------
+local ADDON_PREFIX = "PISync"
+local ADDON_MSG_REQUEST   = "REQ"
+local ADDON_MSG_ACTIVATED = "ACT"
+
 -- States
 local STATE_IDLE      = "IDLE"
 local STATE_REQUESTED = "REQUESTED"
@@ -75,6 +82,51 @@ end
 
 local function DisplayName()
     return PISync.partnerDisplay or PISync.partner or "???"
+end
+
+----------------------------------------------------------------------
+-- Cross-realm safe name for whispers (v3 fix)
+-- UnitName("target") alone wouldnt include realm for xrealm players
+----------------------------------------------------------------------
+local function GetFullName(unit)
+    local name, realm = UnitName(unit)
+    if not name then return nil end
+    if realm and realm ~= "" then
+        return name .. "-" .. realm
+    end
+    local myRealm = GetNormalizedRealmName()
+    return myRealm and (name .. "-" .. myRealm) or name
+end
+
+----------------------------------------------------------------------
+-- message sending (v3 fix)
+-- Primary:  C_ChatInfo.SendAddonMessage  (hidden, works in combat)
+-- Fallback: C_ChatInfo.SendChatMessage   (visible whisper, may fail
+--           in combat due to taint / encounter restrictions)
+----------------------------------------------------------------------
+local function SendPIMessage(addonMsg, whisperText)
+    local partner = PISync.partner
+    if not partner then return false end
+
+    -- Primary: addon channel — try RAID/PARTY first (no xrealm name issues),
+    -- fall back to WHISPER target for addon msg if not grouped
+    local sent = false
+    if IsInRaid() then
+        sent = C_ChatInfo.SendAddonMessage(ADDON_PREFIX, addonMsg, "RAID")
+    elseif IsInGroup() then
+        sent = C_ChatInfo.SendAddonMessage(ADDON_PREFIX, addonMsg, "PARTY")
+    else
+        -- Outside group: addon whisper (needs full Name-Realm)
+        sent = C_ChatInfo.SendAddonMessage(ADDON_PREFIX, addonMsg, "WHISPER", partner)
+    end
+
+    -- Fallback: visible whisper via the NEW 12.0 API (not the deprecated global)
+    -- This is best-effort; may silently fail in combat/instances
+    pcall(function()
+        C_ChatInfo.SendChatMessage(whisperText, "WHISPER", nil, partner)
+    end)
+
+    return sent
 end
 
 ----------------------------------------------------------------------
@@ -329,10 +381,11 @@ PISync:SetScript("OnUpdate", function(self, elapsed)
 end)
 
 ----------------------------------------------------------------------
--- EVENTS (only PLAYER_LOGIN + CHAT_MSG_WHISPER)
+-- EVENTS
 ----------------------------------------------------------------------
 PISync:RegisterEvent("PLAYER_LOGIN")
 PISync:RegisterEvent("CHAT_MSG_WHISPER")
+PISync:RegisterEvent("CHAT_MSG_ADDON")
 
 PISync:SetScript("OnEvent", function(self, event, ...)
     if event == "PLAYER_LOGIN" then
@@ -351,6 +404,7 @@ PISync:SetScript("OnEvent", function(self, event, ...)
         end
 
         SetState(STATE_IDLE)
+        C_ChatInfo.RegisterAddonMessagePrefix(ADDON_PREFIX)
         print("|cff00ccff[PISync]|r loaded! /pi help for commands.")
 
     elseif event == "CHAT_MSG_WHISPER" then
@@ -378,6 +432,40 @@ PISync:SetScript("OnEvent", function(self, event, ...)
             StartActiveTimer()
             print("|cff00ccff[PISync]|r PI active! 15s buff timer started.")
         end
+
+    -------------------------------------------------------------------
+    -- ADDON CHANNEL (v3 fix: more reliable in combat / instances)
+    -------------------------------------------------------------------
+    elseif event == "CHAT_MSG_ADDON" then
+        local prefix, msg, channel, sender = ...
+        if prefix ~= ADDON_PREFIX then return end
+
+        -- Ignore our own messages
+        local me = UnitName("player")
+        local myRealm = GetNormalizedRealmName()
+        local myFull = myRealm and (me .. "-" .. myRealm) or me
+        if sender == myFull or Ambiguate(sender, "short") == me then return end
+
+        local senderShort = Ambiguate(sender, "short")
+
+        if msg == ADDON_MSG_REQUEST then
+            if not self.partner then
+                SetPartner(sender)
+                print("|cff00ccff[PISync]|r Auto-set partner: |cffffff00" .. senderShort .. "|r")
+            end
+            SetState(STATE_REQUESTED)
+            StartBlinking()
+            PlaySound(37881)
+            print("|cff00ccff[PISync]|r |cffff8800" .. senderShort .. "|r wants PI! (addon ch)")
+
+        elseif msg == ADDON_MSG_ACTIVATED then
+            if not self.partner then
+                SetPartner(sender)
+                print("|cff00ccff[PISync]|r Auto-set partner: |cffffff00" .. senderShort .. "|r")
+            end
+            StartActiveTimer()
+            print("|cff00ccff[PISync]|r PI active! 15s buff timer started. (addon ch)")
+        end
     end
 end)
 
@@ -395,13 +483,7 @@ SlashCmdList["PISYNC"] = function(input)
     if cmd == "set" then
         if not arg or arg == "" then
             if UnitExists("target") and UnitIsPlayer("target") then
-                local name, realm = UnitName("target")
-                if realm and realm ~= "" then
-                    arg = name .. "-" .. realm
-                else
-                    local myRealm = GetNormalizedRealmName()
-                    arg = myRealm and (name .. "-" .. myRealm) or name
-                end
+                arg = GetFullName("target")
             else
                 print("|cff00ccff[PISync]|r Target a player, or: /pi set Name-Realm")
                 return
@@ -427,9 +509,9 @@ SlashCmdList["PISYNC"] = function(input)
             print("|cff00ccff[PISync]|r No partner set! /pi set first.")
             return
         end
-        SendChatMessage(WHISPER_ACTIVATED, "WHISPER", nil, PISync.partner)
+        SendPIMessage(ADDON_MSG_ACTIVATED, WHISPER_ACTIVATED)
         StartActiveTimer()
-        print("|cff00ccff[PISync]|r PI activated! Whispered " .. DisplayName() .. ", timer started.")
+        print("|cff00ccff[PISync]|r PI activated! Notified " .. DisplayName() .. ", timer started.")
 
     elseif cmd == "show" then
         PISync:Show()
@@ -469,7 +551,7 @@ SlashCmdList["PISYNC"] = function(input)
             print("|cff00ccff[PISync]|r No partner! /pi set first.")
             return
         end
-        SendChatMessage(WHISPER_REQUEST, "WHISPER", nil, PISync.partner)
+        SendPIMessage(ADDON_MSG_REQUEST, WHISPER_REQUEST)
         SetState(STATE_REQUESTED)
         PISync.timer:SetText("Waiting for " .. DisplayName() .. "...")
         PISync.timer:SetTextColor(1, 0.8, 0.4)
